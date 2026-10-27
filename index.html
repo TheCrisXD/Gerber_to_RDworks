@@ -243,7 +243,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 try:
     import numpy as np
@@ -1603,9 +1603,9 @@ def rol_capa(nombre, texto):
     """Deduce el papel de un Gerber por su nombre y sus comentarios G04."""
     comentarios = " ".join(re.findall(r"G0?4([^*]*)\*", texto[:3000]))
     s = (nombre + " " + comentarios).lower().replace("_", " ").replace("-", " ")
-    if re.search(r"edge|outline|contorno|\bgko\b|\.gm1|mechanical|\bmech\b", s):
+    if re.search(r"edge|outline|profile|perfil|contorno|\bgko\b|\.gm1|mechanical|\bmech\b", s):
         return "borde"
-    if re.search(r"silk|legend|resist|mask|paste|assembl|serigraf|\.gto|\.gbo|\.gts|\.gbs", s):
+    if re.search(r"silk|legend|resist|mask|paste|assembl|serigraf|drill|netlist|\.gto|\.gbo|\.gts|\.gbs", s):
         return "otra"
     if re.search(r"bottom copper|bottom cu|\bb cu\b|\.gbl|back copper|cobre inferior|bot copper|copper bottom|bottom layer", s):
         return "cobre_inf"
@@ -1776,27 +1776,40 @@ def construir_negativo(ent, a, espejo, margen, log):
         raise ErrorUsuario("No se encontro cobre. Revisa los colores/capas con --listar "
                            "(puedes filtrar con --incluir / --excluir).")
 
-    # ---- aviso: contorno de placa (marco fino) incluido en el cobre ----
+    # ---- contorno de placa colado en el cobre (marco fino): se quita y solo sirve para dimensionar ----
     cx0, cy0, cx1, cy1 = cobre.bounds
+    resto, marcos = [], []
     for p in poligonos(cobre):
         b = p.bounds
+        es_marco = False
         if (b[2] - b[0]) >= 0.95 * (cx1 - cx0) and (b[3] - b[1]) >= 0.95 * (cy1 - cy0) and p.interiors:
             hmax = max((Polygon(r).bounds for r in p.interiors), key=lambda t: (t[2] - t[0]) * (t[3] - t[1]))
-            if (hmax[2] - hmax[0]) >= 0.85 * (cx1 - cx0) and (hmax[3] - hmax[1]) >= 0.85 * (cy1 - cy0):
-                log("AVISO: parece que el CONTORNO DE LA PLACA (un marco que rodea todo) quedo dentro del cobre. "
-                    "En ARES desmarca 'Edge (will appear on all layers)' al generar el Gerber, o saldra un marco "
-                    "protegido alrededor de la placa.")
-                break
+            es_marco = (hmax[2] - hmax[0]) >= 0.85 * (cx1 - cx0) and (hmax[3] - hmax[1]) >= 0.85 * (cy1 - cy0)
+        if es_marco:
+            ancho = 2.0 * p.area / (p.exterior.length + sum(r.length for r in p.interiors))
+            if ancho <= 0.5:
+                marcos.append(p)
+                log("El CONTORNO DE LA PLACA venia dentro del Gerber de cobre (linea de %.2f mm): se quito del cobre y "
+                    "solo se usa para dimensionar el rectangulo." % ancho)
+                continue
+            log("AVISO: hay un marco de %.1f mm de ancho que rodea toda la placa; se deja como cobre. Si es el contorno "
+                "de la placa, desmarca 'Edge (will appear on all layers)' en ARES." % ancho)
+        resto.append(p)
+    if marcos:
+        cobre = unary_union(resto)
+    m = margen if margen is not None else (0.5 if (ent.borde or marcos) else 2.0)
 
     # ---- perforaciones: se restan del cobre para que queden EXPUESTAS (circulo dentro de cada pad) ----
     huecos_u, centros = None, None
     if (ent.agujeros or ent.ranuras) and not a.sin_agujeros:
         huecos, diams = [], Counter()
+        expuestos = []
         for x, y, d in ent.agujeros:
             dd = a.diam_agujero if a.diam_agujero > 0 else d + (a.holgura_agujero or 0.0)
             if dd > 0:
                 huecos.append(Point(x, y).buffer(dd / 2.0, quad_segs=segs_cuarto(dd / 2.0)))
                 diams[round(dd, 2)] += 1
+                expuestos.append((x, y, dd))
         for x0, y0, x1, y1, d in ent.ranuras:
             dd = a.diam_agujero if a.diam_agujero > 0 else d + (a.holgura_agujero or 0.0)
             if dd > 0:
@@ -1810,6 +1823,16 @@ def construir_negativo(ent, a, espejo, margen, log):
             centros = unary_union(ctrs) if ctrs else None
             log("Perforaciones: %d (diametros en mm: %s) -> se dejan expuestas como circulos dentro de cada pad"
                 % (len(huecos), ", ".join("%.2f x%d" % kv for kv in sorted(diams.items()))))
+            if expuestos and len(shapely.get_parts(cobre.boundary)):
+                arbol = shapely.STRtree(shapely.get_parts(cobre.boundary))
+                _, dist = arbol.query_nearest(shapely.points([(x, y) for x, y, _ in expuestos]),
+                                              return_distance=True, all_matches=False)
+                anillos_ = np.array([dist[i] - dd / 2.0 for i, (_, _, dd) in enumerate(expuestos)])
+                finos = (anillos_ < 0.15) & dentro[:len(expuestos)]
+                if finos.any():
+                    log("AVISO: %d perforaciones dejan un anillo de cobre de menos de 0.15 mm (minimo %.2f mm): pueden "
+                        "despegarse o desaparecer. Prueba sin holgura, con un --diam-agujero menor, o --sin-agujeros."
+                        % (int(finos.sum()), float(anillos_[finos].min())))
             if int(dentro.sum()) < len(huecos):
                 log("AVISO: %d de %d perforaciones no quedan rodeadas de cobre (agujero sin pad, NPTH, o el pad es "
                     "mas chico que el taladro)." % (len(huecos) - int(dentro.sum()), len(huecos)))
@@ -1819,7 +1842,7 @@ def construir_negativo(ent, a, espejo, margen, log):
     cobre = cobre.buffer(CIERRE, quad_segs=4).buffer(-CIERRE, quad_segs=4)      # cierra rendijas numericas
     if a.compensacion:
         cobre = cobre.buffer(a.compensacion, quad_segs=8)
-    bordes = list(ent.borde)
+    bordes = list(ent.borde) + marcos
     if espejo:
         esp = lambda g: affinity.scale(g, xfact=-1, yfact=1, origin=(0, 0))
         cobre = esp(cobre)
@@ -1827,7 +1850,6 @@ def construir_negativo(ent, a, espejo, margen, log):
         centros = esp(centros) if centros is not None else None
     minx, miny, maxx, maxy = unary_union([cobre] + bordes).bounds
     cw, ch = maxx - minx, maxy - miny
-    m = margen
     rect = box(minx - m, miny - m, maxx + m, maxy + m)
     dx, dy = -rect.bounds[0], -rect.bounds[1]
     cobre = affinity.translate(cobre, dx, dy)
@@ -2234,7 +2256,7 @@ def generar_salidas(ent, a, base1, base2, espejo, margen, quiere, log):
                 rutas.append(base2 + ".plt")
                 log("  %s.plt" % base2)
             if "svg" in a.formatos:
-                escribir_svg(base2 + ".svg", polis, W, H, contorno=True)
+                escribir_svg(base2 + ".svg", polis, W, H)
                 rutas.append(base2 + ".svg")
                 log("  %s.svg" % base2)
             log("  Diametros de corte (mm): %s%s" % (
@@ -2268,7 +2290,7 @@ def procesar(a):
     if a.listar:
         return 0
     espejo = a.espejo if a.espejo is not None else ent.espejo_sugerido
-    margen = a.margen if a.margen is not None else (0.5 if ent.borde else 2.0)
+    margen = a.margen                   # None = automatico (lo resuelve construir_negativo)
 
     # ---- archivos SOLO de las perforaciones (para cortarlas despues con el laser): preguntar si no se indico ----
     hay_perfo = bool(ent.agujeros or ent.ranuras)
@@ -2392,7 +2414,7 @@ def web_convertir(dir_in, dir_out, opciones_json):
                 raise ErrorUsuario("Para 'solo perforaciones' hace falta el archivo de taladros (Drill / Excellon).")
         quiere = quiere and hay_perfo
         espejo = a.espejo if a.espejo is not None else ent.espejo_sugerido
-        margen = a.margen if a.margen is not None else (0.5 if ent.borde else 2.0)
+        margen = a.margen                   # None = automatico (lo resuelve construir_negativo)
 
         os.makedirs(dir_out, exist_ok=True)
         stem = re.sub(r"[^\w.-]+", "_", os.path.splitext(cobre or "placa")[0]).strip(" ._") or "placa"
